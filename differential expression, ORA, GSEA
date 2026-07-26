@@ -1,0 +1,1302 @@
+#### open packages in library ####
+
+library(edgeR)
+library(limma)
+library(Glimma)
+library(ggplot2)
+library(ggrepel)
+library(RColorBrewer)
+library(biomaRt)
+library(org.Mm.eg.db)
+library(AnnotationDbi)
+library(clusterProfiler)
+library(sva)
+library(dplyr)
+library(tidyr)
+library(tibble)
+
+##### import counts ####
+
+files <- list.files(
+"counts",
+ pattern = "Aligned.sortedByCoord.out.counts.txt$",
+ full.names = TRUE
+)
+
+# Read first file to get gene IDs
+y0 <- read.delim(files[1], comment.char = "#")
+colnames(y0)
+
+gene <- sub("\\..*", "", y0$Geneid)  # remove version numbers
+
+# Read counts
+count_list <- lapply(files, function(f) {
+ y <- read.delim(f, comment.char = "#")
+ y[[ncol(y)]]
+})
+
+# Combine into matrix
+counts <- do.call(cbind, count_list)
+rownames(counts) <- gene
+colnames(counts) <- sub(
+  "^11334_",
+  "",
+  sub("Aligned.sortedByCoord.out.counts.txt$", "", basename(files))
+)
+  
+# Read first file to get gene IDs
+y01 <- read.delim(files[1], comment.char = "#")
+colnames(y01)
+  
+gene1 <- sub("\\..*", "", y01$Geneid)  # remove version numbers
+  
+# Read counts
+count_list1 <- lapply(files, function(f) {
+  y1 <- read.delim(f, comment.char = "#")
+  y1[[ncol(y1)]]
+  })
+  
+# Combine into matrix
+counts1 <- do.call(cbind, count_list1)
+rownames(counts1) <- gene1
+colnames(counts1) <- sub(
+   "^12083_",
+   "",
+sub("Aligned.sortedByCoord.out.counts.txt$", "", basename(files))
+  )
+  colnames(counts1) <- sub("^12083_", "",
+                      sub("^11950_", "",
+                      sub("Aligned.sortedByCoord.out.counts.txt$", "", basename(files))))
+
+## Loads in pre-computed gene matrix, skipping above steps
+counts <- readRDS("TRIOSYNcounts.rds")
+
+#### Read in trio samples and annotate ####
+
+trio <- read.csv("Trio_samples.csv")
+trio$genotype <- factor(trio$genotype)
+trio$sex <- factor(trio$sex)
+
+geneid <- select(org.Mm.eg.db,
+                  keys = gene,
+                  columns = c("SYMBOL", "ENTREZID"),
+                  keytype = "ENSEMBL")
+
+#### Keep only common samples and order them ####
+
+common.samples <- intersect(colnames(counts), trio$sample)
+colnames(counts)
+counts <- counts[, common.samples]
+trio <- trio[match(common.samples, trio$sample), ]
+rownames(trio) <- trio$sample
+
+#### create the DGEList ####
+
+x <- DGEList(counts = counts, samples = trio)
+
+common.samples <- intersect(colnames(x), rownames(trio))
+x <- x[, common.samples]
+trio <- trio[common.samples, ]
+
+all(colnames(x$counts) == x$samples$sample)  # should be TRUE
+rownames(trio) <- trio$sample
+all(colnames(x$counts) == rownames(trio))
+
+# Initial outlier removal based on MDS — later revised after reviewing additional QC metrics (library size, gene detection rate) 
+# Samples 15 and 24 removed in final analysis, 30, 40, 54 retained
+
+#### Remove outliers ####
+
+drop.samples <- c("15", "24", "30", "40", "54")
+counts <- counts[, !colnames(counts) %in% drop.samples]
+
+##### Re-align metadata ####
+
+trio <- trio[trio$sample %in% colnames(counts), ]
+trio <- trio[match(colnames(counts), trio$sample), ]
+
+#### Get gene biotypes ####
+
+mart <- useMart(
+  biomart = "ensembl",
+  dataset = "mmusculus_gene_ensembl",
+  host    = "https://nov2020.archive.ensembl.org"
+)
+
+#biotype <- getBM(
+ # attributes = c("ensembl_gene_id", "gene_biotype"),
+ # filters = "ensembl_gene_id",
+  #values = rownames(x$counts),
+  #mart = mart
+#)
+
+annot <- getBM(
+  attributes = c(
+    "ensembl_gene_id",
+    "external_gene_name"
+  ),
+  filters = "ensembl_gene_id",
+  values = rownames(x$counts),
+  mart = mart
+)
+
+x$genes <- annot[  match(rownames(x), annot$ensembl_gene_id),]
+
+
+# Keep protein-coding genes only
+
+#pc_genes <- biotype$ensembl_gene_id[biotype$gene_biotype == "protein_coding"]
+pc_genes <- readRDS("pc_genesTRIOSYN.rds")
+
+# Filter the DGEList for protein-coding genes
+
+keep_genes <- rownames(x) %in% pc_genes
+x <- x[keep_genes, , keep.lib.sizes = FALSE]
+
+# Converting counts to log counts per million
+
+cpm <- cpm(x)
+lcpm <- cpm(x, log=TRUE)
+
+L <- mean(x$samples$lib.size) * 1e-6
+M <- median(x$samples$lib.size) * 1e-6
+c(L, M)
+
+# Removing lowly expressed genes by design matrix
+
+x$samples$group <- interaction(x$samples$genotype, x$samples$age, sep = ".")
+design0 <- model.matrix(~0 + group + sex + batch, data = x$samples)
+keep.exprs <- filterByExpr(x, design = design0)
+x <- x[keep.exprs, , keep.lib.sizes = FALSE]
+
+dim(x)
+
+# Normalising gene expression distributions
+
+x <- calcNormFactors(x, method = "TMM")
+x$samples$norm.factors
+
+## Pre-computed DGEList with TMM normalisation applied — regenerate by running filtering and calcNormFactors steps above
+x <- readRDS("dgelistTRIOSYNgenperage.rds")
+
+#### Converting counts to log counts per million ####
+
+cpm <- cpm(x)
+lcpm <- cpm(x, log=TRUE)
+
+---#### QC ####---
+
+#### PCA ####
+
+pca <- prcomp(t(lcpm), scale. = FALSE)
+pcs <- pca$x
+percentVar <- round(  100 * pca$sdev^2 / sum(pca$sdev^2),  )
+
+#### MDS and PCA plots ####
+
+make_plots <- TRUE
+batch  <- trio$batch
+
+if(make_plots){lcpm <- cpm(x, log=TRUE)
+par(mfrow=c(1,2))
+group <- factor(x$samples$genotype)
+age <- factor(x$samples$age)
+
+cols <- c("0" = "blue", "7" = "red", "35" = "green")
+col.group <- cols[group]
+col.age <- cols[age]
+plotMDS(lcpm, dim = c(1,2), col = col.age, labels = x$samples$genotype) # Dimensions 1 & 2
+str(x$samples)
+plotMDS(lcpm, dim = c(3,4), col = col.group, labels = x$samples$age) # Dimensions 3 & 4
+title("MDS: dimensions 3 and 4")
+plotMDS(lcpm, labels=batch, col= as.numeric(batch), dim=c(3,4))
+}
+
+if(make_plots){plotMDS(lcpm, dim = c(1,2), col = col.group, labels = x$samples$age)
+  title("MDS labelled by age")
+  plotMDS(lcpm, dim = c(1,2), col = col.group, labels = x$samples$sample)
+  title("MDS labelled by sample") 
+  plotMDS(lcpm, dim = c(3,4), col = col.group, labels = x$samples$age) # Principal components 3 & 4
+  plotMDS(lcpm, dim = c(3,4), col = col.group, labels = x$samples$sample)
+
+#### Create data frame for plotting ####
+  
+  x$samples$age <- factor(x$samples$age, levels=c("0","7","35"))
+  pca_df <- data.frame(PC1 = pca$x[,1],
+                       PC2 = pca$x[,2],
+                       Genotype = x$samples$genotype,
+                       Age = x$samples$age,
+                       Batch = x$samples$batch,  Sample = rownames(x$samples))
+  
+  par(mfrow=c(1,2))
+  ggplot(pca_df, aes(x = PC1, y = PC2, color = Age, shape = Genotype)) +
+    geom_point(size = 4) +
+    geom_text_repel(aes(label = Sample), size = 3, max.overlaps = Inf) +
+    xlab(paste0("PC1: ", percentVar[1], "%")) +
+    ylab(paste0("PC2: ", percentVar[2], "%")) +
+    theme_classic() +
+    ggtitle("PCA of RNA-seq samples")} # Samples 15, 24, 30, 40, 54 are outliers
+
+# Sample-sample correlations
+
+cor_mat <- cor(v$E)
+pheatmap::pheatmap(cor_mat)
+boxplot(v$E,
+         las = 2,
+         outline = FALSE)
+hc <- hclust(dist(t(v$E)))
+plot(hc)
+
+# Library size visualisation
+
+barplot(x$samples$lib.size)
+x$samples$lib.size
+
+# Counts per million comparison
+
+detected <- colSums(cpm(x) > 1)
+barplot(detected)
+
+# Initial outlier removal based on MDS — later revised after reviewing additional QC metrics (library size, gene detection rate) 
+# Samples 15 and 24 removed in final analysis, 30, 40, 54 retained
+
+#### Correlation tests between metadata variables and principal components ####
+
+meta <- x$samples
+meta$scode[meta$sex=="M"] <- 1
+meta$scode[meta$sex=="F"] <- 2
+
+stopifnot(rownames(pcs) == rownames(meta))
+
+meta$age <- as.numeric(meta$age)
+meta$batch <- as.numeric(meta$batch)
+
+cor.test(pcs[,1], meta$age)
+cor.test(pcs[,2], meta$age) # Principal components 1 and 2 correlate with age (particularly component 1)
+
+cor.test(pcs[,1], meta$batch)
+cor.test(pcs[,2], meta$batch) # Principal components 1 and 2 do not correlate with batch
+
+cor.test(pcs[,3], meta$batch) # Principal component 3 correlates with batch, not when filtered for pc genes
+
+cor.test(pcs[,1], meta$scode) # Principal components do not correlate with sex
+cor.test(pcs[,2], meta$scode)
+cor.test(pcs[,3], meta$scode)
+cor.test(pcs[,4], meta$scode) # Principal component 4 correlates with sex when filtered for pc genes
+vars <- c("genotype", "scode", "batch", "age")
+
+results <- lapply(1:5, function(pc) {
+  sapply(vars, function(v) {
+    if (is.numeric(meta[[v]])) {
+      cor.test(pcs[,pc], meta[[v]])$p.value
+    } else {
+      summary(aov(pcs[,pc] ~ meta[[v]]))[[1]][["Pr(>F)"]][1]
+    }
+  })
+})
+
+pc_assoc <- do.call(rbind, results)
+rownames(pc_assoc) <- paste0("PC", 1:5)
+pc_assoc
+
+### Surrogate variables ###
+
+library(sva)
+
+x$samples$sampleID <- rownames(x$samples)
+mod  <- model.matrix(~ genotype + age + batch + sex, data = x$samples)
+mod0 <- model.matrix(~ age + batch + sex, data = x$samples)
+svobj <- sva::svaseq(dat = as.matrix(x$counts), mod = mod, mod0 = mod0)
+
+sv <- as.data.frame(svobj$sv)
+colnames(sv) <- paste0("SV", seq_len(ncol(sv)))
+rownames(sv) <- x$samples$sampleID
+x$samples <- cbind(x$samples, sv)
+
+#### Model WT vs. HET all ages ####
+
+x$samples$genotype <- relevel(x$samples$genotype, "WT")
+
+sapply(x$samples[, c("group", "age", "sex", "batch")], function(v) {
+  if (is.factor(v)) nlevels(v) else length(unique(v))
+})
+x$samples$age <- factor(x$samples$age)
+x$samples$genotype <- factor(x$samples$genotype)
+x$samples$sex   <- factor(x$samples$sex)
+x$samples$batch <- factor(x$samples$batch)
+
+head(colnames(x))
+
+
+design_main <- model.matrix(~ genotype + age + sex + batch + SV1 + SV2 + SV3 + SV4 + SV5 + SV6 + SV7 + SV8 + SV9, data = x$samples)
+
+v <- voom(x, design_main)
+fit <- lmFit(v, design_main)
+fit <- eBayes(fit)
+topTable(fit, coef="genotypeHET")
+
+rank_main  <- topTable(fit, coef = "genotypeHET",  number = Inf, sort.by = "P")
+maintriosynaptosome <- topTable(fit, coef = "genotypeHET", p.value = 0.05, lfc = 0)
+maintriosynaptosome$ensembl_gene_id <- rownames(maintriosynaptosome)
+
+summary(decideTests(fit)) # 1 gene upregulated, 1 downregulated
+
+#### Model WT vs. HET at each age ####
+
+x$samples$group <- interaction(x$samples$genotype, x$samples$age, sep= ".")
+MODEL <- model.matrix(~0 + group + sex + batch + SV1 + SV2 + SV3 + SV4 + SV5 + SV6 + SV7 + SV8 + SV9, data = x$samples)
+
+contr.matrix <- makeContrasts(
+  HETvsWT_age0  = groupHET.0  - groupWT.0,
+  HETvsWT_age7  = groupHET.7  - groupWT.7,
+  HETvsWT_age35 = groupHET.35 - groupWT.35,
+  levels = colnames(MODEL)
+)
+levels(x$samples$genotype)
+v   <- voom(x, MODEL)
+vfit <- lmFit(v, MODEL)
+vfit <- contrasts.fit(vfit, contrasts=contr.matrix)
+efit <- eBayes(vfit)
+summary(decideTests(efit))
+
+p0triosynaptosome <- topTable(efit, coef = "HETvsWT_age0", p.value = 0.05, lfc = 0) # 2 downregulated, 1 upregulated
+p7triosynaptosome <- topTable(efit, coef = "HETvsWT_age7", p.value = 0.05, lfc = 0) # 2 downregulated
+p35triosynaptosomes <- topTable(efit, coef = "HETvsWT_age35", p.value = 0.05, lfc = 0) # 14 downregulated, 72 upregulated
+
+### Cluster profiler analysis ###
+
+library(clusterProfiler)
+
+rank_main  <- topTable(fit, coef = "genotypeHET",  number = Inf, sort.by = "P")
+rank_age0  <- topTable(efit, coef = "HETvsWT_age0",  number = Inf, sort.by = "P")
+rank_age7  <- topTable(efit, coef = "HETvsWT_age7",  number = Inf, sort.by = "P")
+rank_age35 <- topTable(efit, coef = "HETvsWT_age35", number = Inf, sort.by = "P")
+
+# Add ENSEMBL column to ranked tables
+rank_main$ENSEMBL <- rownames(rank_main)
+rank_age0$ENSEMBL  <- rownames(rank_age0)
+rank_age7$ENSEMBL  <- rownames(rank_age7)
+rank_age35$ENSEMBL <- rownames(rank_age35)
+
+# Make rank statistic vector
+stat <- -log10(rank_main$P.Value)
+stat1 <- -log10(rank_age0$P.Value)
+stat2 <- -log10(rank_age7$P.Value)
+stat3 <- -log10(rank_age35$P.Value)
+
+# Name vector by ENSEMBL
+names(stat) <- rank_main$ENSEMBL
+names(stat1) <- rank_age0$ENSEMBL
+names(stat2) <- rank_age7$ENSEMBL
+names(stat3) <- rank_age35$ENSEMBL
+
+# Sort decreasing 
+rankvec_main <- sort(stat, decreasing = TRUE)
+rankvec_age0 <- sort(stat1, decreasing = TRUE)
+rankvec_age7 <- sort(stat2, decreasing = TRUE)
+rankvec_age35 <- sort(stat3, decreasing = TRUE)
+
+# Run GSEA
+gse_age35 <- gseGO(
+  geneList = rankvec_age35,
+  OrgDb = org.Mm.eg.db,
+  ont = "CC",
+  keyType = "ENSEMBL",
+  scoreType = "pos",
+  minGSSize = 10,
+  maxGSSize = 500,
+  pvalueCutoff = 1,
+  verbose = TRUE)
+
+
+GSEA_main <- as.data.frame(gse_main)
+write.csv(GSEA_main, file = "GSEA_main_pvalrank.csv")
+
+GSEA_age0 <- as.data.frame(gse_age0)
+write.csv(GSEA_age0, file = "GSEA_age0_pvalrank.csv")
+
+GSEA_age7 <- as.data.frame(gse_age7)
+write.csv(GSEA_age7, file = "GSEA_age7_pvalrank.csv")
+
+GSEA_age35 <- as.data.frame(gse_age35)
+write.csv(GSEA_age35, file = "GSEA_age35_pvalrank.csv")
+
+### Up vs. downregulated GSE ###
+
+make_signed <- function(df) {
+  signstat <- -log10(df$P.Value) * sign(df$logFC)
+  names(signstat) <- df$ENSEMBL   
+  signstat
+}
+signed_rank_age35 <- sort(make_signed(rank_age35), decreasing = TRUE)
+signed_rank_main <- sort(make_signed(rank_main), decreasing = TRUE)
+signed_rank_age0 <- sort(make_signed(rank_age0), decreasing = TRUE)
+signed_rank_age7 <- sort(make_signed(rank_age7), decreasing = TRUE)
+
+gse_age0_signed <- gseGO(
+  geneList = signed_rank_age0,
+  OrgDb = org.Mm.eg.db,
+  keyType = "ENSEMBL",
+  ont = "BP",
+  minGSSize = 10,
+  maxGSSize = 500,
+  pvalueCutoff = 1,
+  verbose = TRUE)
+
+GSEA_age0_signed <- readRDS("GSEA_age0_signed.rds")
+
+GSEA_age35_signed <- readRDS("GSEA_age35_signed.rds")
+
+GSEA_age7_signed <- readRDS("GSEA_age7_signed.rds")
+
+# NEW PLOT -- For single pre-synapse gene
+gene_id <- c("ENSMUSG00000058975","ENSMUSG00000035681","ENSMUSG00000062785", "ENSMUSG00000027895")
+                          
+df_gene <- data.frame(
+expr     = as.numeric(lcpm[gene_id, ]),
+age      = factor(x$samples$age, levels = c("0","7","35")),
+genotype = x$samples$genotype
+)
+
+df_kcnc1 <- aggregate(expr ~ age + genotype, data = df_gene, mean)
+                          
+library(ggplot2)
+                          
+p_gene <- ggplot(data=df_kcnc1, aes(x = age, y = expr, color = genotype, group = genotype)) +
+geom_line() +
+geom_point() +
+theme_classic() +
+labs(y = "logCPM", x = "Age (days)")
+
+print(p_gene)
+
+
+gene_id <- c(
+  "ENSMUSG00000058975",
+  "ENSMUSG00000035681",
+  "ENSMUSG00000062785",
+  "ENSMUSG00000027895"
+)
+
+expr_mat <- lcpm[gene_id, , drop = FALSE]
+
+df_gene <- data.frame(
+  gene = rep(rownames(expr_mat), times = ncol(expr_mat)),
+  expr = as.vector(t(expr_mat)),
+  age = rep(factor(x$samples$age, levels = c("0","7","35")),
+            each = nrow(expr_mat)),
+  genotype = rep(x$samples$genotype,
+                 each = nrow(expr_mat))
+)
+
+gene_names <- c(
+  "ENSMUSG00000058975" = "Kcnc1",
+  "ENSMUSG00000035681" = "Kcnc2",
+  "ENSMUSG00000062785" = "Kcnc3",
+  "ENSMUSG00000027895" = "Kcnc4"
+)
+
+df_gene$gene <- gene_names[df_gene$gene]
+
+
+library(dplyr)
+
+df_kcnc <- df_gene |>
+  group_by(gene, age, genotype) |>
+  summarise(expr = mean(expr), .groups = "drop")
+
+ggplot(df_kcnc,
+       aes(x = age,
+           y = expr,
+           color = genotype,
+           group = genotype)) +
+  geom_line() +
+  geom_point() +
+  facet_wrap(~ gene, scales = "free_y") +
+  theme_classic() +
+  labs(y = "logCPM", x = "Age (days)")
+
+
+kcnc_ids <- c(
+  "ENSMUSG00000058975", # Kcnc1
+  "ENSMUSG00000035681", # Kcnc2
+  "ENSMUSG00000062785", # Kcnc3
+  "ENSMUSG00000027895"  # Kcnc4
+)
+
+kcnc_names <- c("Kcnc1","Kcnc2","Kcnc3","Kcnc4")
+
+expr_mat <- lcpm[kcnc_ids, , drop = FALSE]
+rownames(expr_mat) <- kcnc_names
+
+prop_mat <- sweep(expr_mat, 2, colSums(expr_mat), "/")
+
+library(tidyverse)
+
+df_prop <- as.data.frame(prop_mat) |>
+  rownames_to_column("gene") |>
+  pivot_longer(
+    -gene,
+    names_to = "sample",
+    values_to = "proportion"
+  )
+
+df_prop$age <- factor(
+  x$samples$age[match(df_prop$sample, colnames(lcpm))],
+  levels = c("0","7","35")
+)
+
+df_prop$genotype <- x$samples$genotype[
+  match(df_prop$sample, colnames(lcpm))
+]
+
+
+df_plot <- df_prop |>
+  group_by(age, genotype, gene) |>
+  summarise(
+    mean = mean(proportion),
+    sem = sd(proportion)/sqrt(n()),
+    .groups = "drop"
+  )
+
+
+ggplot(df_plot,
+       aes(age, mean,
+           colour = gene,
+           group = gene)) +
+  geom_line() +
+  geom_point() +
+  facet_wrap(~ genotype) +
+  theme_classic() +
+  labs(
+    y = "Relative Kv3 abundance",
+    x = "Age (days)"
+  )
+
+### Cell cycle genes plot ###
+
+Cc_ids <- c(
+  "ENSMUSG00000041431", # Ccnb1
+  "ENSMUSG00000019942", # Cdk1
+  "ENSMUSG00000027715", # Ccna2
+  "ENSMUSG00000020914",  # Top2a
+  "ENSMUSG00000030867"   # Plk1
+)
+
+Cc_names <- c("Ccnb1","Cdk1","Ccna2","Top2a","Plk1")
+
+expr_mat <- lcpm[Cc_ids, , drop = FALSE]
+rownames(expr_mat) <- Cc_names
+
+library(tidyverse)
+
+df_prop <- as.data.frame(expr_mat) |>
+  rownames_to_column("gene") |>
+  pivot_longer(
+    -gene,
+    names_to = "sample",
+    values_to = "proportion"
+  )
+
+df_prop$age <- factor(
+  x$samples$age[match(df_prop$sample, colnames(lcpm))],
+  levels = c("0","7","35")
+)
+
+df_prop$genotype <- x$samples$genotype[
+  match(df_prop$sample, colnames(lcpm))
+]
+
+
+df_plot <- df_prop |>
+  group_by(age, genotype, gene) |>
+  summarise(
+    mean = mean(proportion),
+    sem = sd(proportion)/sqrt(n()),
+    .groups = "drop"
+  )
+
+
+ggplot(df_plot,
+       aes(age, mean,
+           colour = gene,
+           group = gene)) +
+  geom_line() +
+  geom_point() +
+  facet_wrap(~ genotype) +
+  theme_classic() +
+  labs(
+    y = "expression",
+    x = "Age (days)"
+  )
+
+# NEW PLOT -- For pre-synapse gene set
+
+# get the GO ID for the whole pre-synapse term
+go_id <- GSEA_age0_signed$ID[GSEA_age0_signed$Description == "dendrite morphogenesis"]
+                          
+# pull the full gene set used by GSEA 
+presyn_genes_all <- gse_age0_signed@geneSets[[go_id]]
+length(presyn_genes_all)
+head(presyn_genes_all)
+genes <- intersect(presyn_genes_all, rownames(lcpm))
+expr_mat <- lcpm[genes, , drop = FALSE]
+set_score <- colMeans(expr_mat, na.rm = TRUE)                          
+
+df_set <- data.frame(
+  sample   = colnames(lcpm),
+  score    = as.numeric(set_score),
+  age      = factor(x$samples$age, levels = c("0","7","35")),
+  genotype = x$samples$genotype
+)
+
+
+df_presynassemble <- aggregate(score ~ age + genotype, data = df_set, mean)
+
+ggplot(data=df_presynassemble, aes(x = age, y = score, color = genotype, group = genotype)) +
+  geom_line() +
+  geom_point() +
+  theme_classic() +
+  labs(y = "logCPM", x = "Age (days)")
+                          
+# NEW PLOT -- For mean HET-WT difference in gene expression for pre-synapse gene
+age <- factor(x$samples$age, levels = c("0","7","35"))
+geno <- x$samples$genotype
+
+# mean per gene within each age+genotype
+mean_by_gene <- function(g) tapply(expr_mat[g, ], list(age, geno), mean)
+
+# compute HET-WT per gene per age, then average across genes
+delta_mat <- sapply(genes, function(g) {
+  m <- tapply(expr_mat[g, ], list(age, geno), mean)
+  m[, "HET"] - m[, "WT"]
+})
+
+# delta_mat is age x gene; take mean across genes
+delta_mean <- rowMeans(delta_mat, na.rm = TRUE)
+delta_se <- apply(delta_mat, 1, function(expr_mat) sd(expr_mat, na.rm = TRUE)/sqrt(sum(!is.na(expr_mat))))
+df_delta <- data.frame(
+  age = factor(names(delta_mean), levels = c("0","7","35")),
+  mean_delta = as.numeric(delta_mean),
+  se = as.numeric(delta_se)
+)
+
+# plot
+library(ggplot2)
+ggplot(df_delta, aes(x = age, y = mean_delta, group = 1)) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 2) +
+  geom_errorbar(aes(ymin = mean_delta - se, ymax = mean_delta + se),
+                width = 0.15, linewidth = 0.4) +
+  theme_classic() +
+  labs(
+    title = "Presynapse assembly gene set: mean(HET − WT) logCPM across ages",
+    x = "Age (days)",
+    y = "Mean ΔlogCPM (HET − WT) (±SE across genes)"
+  )
+
+library(dplyr)
+library(tibble)
+library(tidyr)
+
+# Pivot to wide — one row per GO term, one column per age
+GSEA_age0_signed$comparison  <- "age0"
+GSEA_age7_signed$comparison  <- "age7"
+GSEA_age35_signed$comparison <- "age35"
+gsea_all <- bind_rows(GSEA_age0_signed, GSEA_age7_signed, GSEA_age35_signed)
+graph_presyn <- as.data.frame(gsea_all[gsea_all$Description == "presynapse assembly", c("core_enrichment","comparison")])
+nes_wide <- gsea_all |>
+  select(ID, Description, NES, comparison) |>
+  pivot_wider(
+    names_from  = comparison,
+    values_from = NES
+  )
+
+# Only keep terms significant in at least one age (p.adjust < 0.05) and present in at least 2 ages
+sig_terms <- gsea_all |>
+  filter(p.adjust < 0.05)
+
+|>
+  group_by(ID, Description) |>
+  summarise(n_comparisons = n_distinct(comparison), .groups = "drop") |>
+  filter(n_comparisons >= 2)
+
+presynapse_genes0 <- strsplit(sig_terms$core_enrichment[sig_terms$Description == "presynapse assembly"& sig_terms$comparison == "age0"],"/")[[1]]
+presynapse_genes7 <- strsplit(sig_terms$core_enrichment[sig_terms$Description == "presynapse assembly"& sig_terms$comparison == "age7"],"/")[[1]]
+presynapse_union <- unique( c(presynapse_genes0, presynapse_genes7))
+# Filter nes_wide to only these terms
+nes_filtered <- nes_wide |>
+  filter(ID %in% sig_terms$ID)
+
+#----Plot heatmap----
+library(pheatmap)
+library(tidyverse)
+mat <- nes_filtered |>
+  column_to_rownames("Description") |>
+  select(age0, age7, age35) |>
+  as.matrix()
+
+pheatmap(mat,
+         cluster_cols = FALSE,   # keep ages in order
+         cluster_rows = TRUE,
+         na_col       = "grey90",
+         color        = colorRampPalette(c("blue", "white", "red"))(50),
+         main         = "NES across ages — GO:CC GSEA"
+)
+# Keep top 5 positive and top 5 negative NES rows
+top_pos  <- order(rowMeans(mat, na.rm = TRUE), decreasing = TRUE)[1:5]
+top_neg  <- order(rowMeans(mat, na.rm = TRUE), decreasing = FALSE)[1:5]
+mat_trim <- mat[c(top_pos, top_neg), ]
+keep_terms <- c(
+  "presynapse assembly",
+  "cell-cell adhesion via plasma-membrane adhesion molecules",
+  "cytoplasmic translation",
+  "positive regulation of cell cycle",
+  "cell cycle G1/S phase transition",
+  "neuropeptide signaling pathway"
+)
+
+mat_trim <- mat[rownames(mat) %in% keep_terms, ]
+rownames(mat_trim) <- c(
+  "cytoplasmic translation",
+  "cell-cell adhesion",
+  "neuropeptide signalling",
+  "positive regulation of cell cycle",
+  "presynapse assembly",
+  "cell cycle G1/S phase transition"
+)
+colnames(mat_trim) <- c("P0", "P7", "P35")
+scale_colour_manual(values = c("Up" = "#E69F00", "Down" = "#0072B2", "NS" = "grey70"))
+png("heatmap.png", width = 10, height = 8, units = "in", res = 300)
+pheatmap(mat_trim,
+         cluster_cols = FALSE,
+         cluster_rows = TRUE,
+         na_col       = "grey90",
+         color        = colorRampPalette(c("#0072B2", "white", "#E8845A"))(50),
+         fontsize_row = 18,
+         fontsize_col = 18,
+         angle_col = 0
+)
+dev.off()
+png("heatmap.png", width = 10, height = 8, units = "in", res = 300)
+pheatmap(mat_trim,
+         cluster_cols  = FALSE,
+         cluster_rows  = TRUE,
+         na_col        = "grey90",
+         color         = colorRampPalette(c("#0072B2", "white", "#CC79A7"))(50),
+         fontsize_row  = 10,
+         fontsize_col  = 10,
+         cellwidth     = 30,
+         cellheight    = 35,
+         angle_col     = 0,
+         treeheight_row = 20
+)
+dev.off()
+# p35 statistic overrepresentation analysis
+
+background <- rownames(rank_age35)
+DEG35 <- rownames(rank_age35)[rank_age35$adj.P.Val < 0.05]
+
+ora35 <- enrichGO(
+  gene = DEG35,
+  universe = background,
+  OrgDb = org.Mm.eg.db,
+  keyType = "ENSEMBL",
+  ont = "BP",       
+  pAdjustMethod = "BH",
+  qvalueCutoff = 0.05, ###
+  readable = TRUE)
+
+ORA35 <- as.data.frame(ora35)
+
+ORA35 <- readRDS("ORA_35.rds")
+
+# Compared to gprofiler analysis
+
+library(gprofiler2)
+gprofiler35 <- gost(DEG35,
+                  exclude_iea = T, 
+                  organism = "mmusculus",
+                  correction_method = "bonferroni",
+                  sources = c("GO:BP"),
+                  custom_bg = background)
+
+View(arrange(gprofiler35$result))
+gprofiler35_result <- as.data.frame(gprofiler35$result)
+saveRDS(gprofiler35_result, file = "gprofiler35.rds")
+
+gprofiler_35 <- readRDS("gprofiler35.rds")
+
+gprofiler35$result$parents <- sapply(gprofiler35$result$parents, paste, collapse=",")
+write.csv(gprofiler35$result, file = "gprofiler35_CC.csv", row.names = FALSE)
+
+#DE volcano plot
+
+library(ggplot2)
+library(ggrepel)
+
+# Get full P35 results with gene symbols
+rank_age35$ENSEMBL <- rownames(rank_age35)
+library(AnnotationDbi)
+
+symbols <- mapIds(
+  org.Mm.eg.db,
+  keys     = rownames(rank_age35),
+  column   = "SYMBOL",
+  keytype  = "ENSEMBL",
+  multiVals = "first"
+)
+
+rank_age35$mgi_symbol <- symbols[rownames(rank_age35)]
+
+gene_map35 <- getBM(
+  attributes = c("ensembl_gene_id", "mgi_symbol"),
+  filters    = "ensembl_gene_id",
+  values     = rownames(rank_age35),
+  mart       = mart
+)
+
+rank_age35 <- rank_age35 %>%
+  left_join(gene_map35, by = c("ENSEMBL" = "ensembl_gene_id"))
+
+# Label significance
+rank_age35$sig <- "NS"
+rank_age35$sig[rank_age35$adj.P.Val < 0.05 & rank_age35$logFC > 0] <- "Up"
+rank_age35$sig[rank_age35$adj.P.Val < 0.05 & rank_age35$logFC < 0] <- "Down"
+
+# Label only significant genes by name
+rank_age35$label <- ifelse(rank_age35$sig != "NS", rank_age35$mgi_symbol, NA)
+rank_age35$label <- ifelse(rank_age35$sig != "NS" & rank_age35$adj.P.Val < 0.05, rank_age35$mgi_symbol, NA)
+top_up   <- rownames(rank_age35)[rank_age35$sig == "Up"   & rank_age35$logFC > 1.2]
+top_down <- rownames(rank_age35)[rank_age35$sig == "Down" & rank_age35$logFC < -1]
+rank_age35$label <- ifelse(rownames(rank_age35) %in% c(top_up, top_down), rank_age35$mgi_symbol, NA)
+top_sig  <- rownames(rank_age35)[rank_age35$adj.P.Val < 0.005]
+top_up   <- rownames(rank_age35)[rank_age35$sig == "Up"   & rank_age35$logFC > 1.2]
+top_down <- rownames(rank_age35)[rank_age35$sig == "Down" & rank_age35$logFC < -1]
+
+rank_age35$label <- ifelse(
+  rownames(rank_age35) %in% c(top_sig, top_up, top_down),
+  rank_age35$mgi_symbol,
+  NA
+)
+rank_age35$label[rank_age35$mgi_symbol == "Pnoc"] <- NA
+rank_age35$label[rank_age35$mgi_symbol == "H3c3"] <- NA
+rank_age35$label[rank_age35$mgi_symbol == "Lrrc43"] <- NA
+
+ggplot(rank_age35, aes(x = logFC, y = -log10(adj.P.Val), colour = sig)) +
+  geom_point(size = 1.2, alpha = 0.6) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", colour = "grey50") +
+  scale_colour_manual(values = c("Up" = "#e05050", "Down" = "#2a9daf", "NS" = "grey70")) +
+  geom_text_repel(aes(label = label), size = 5, max.overlaps = 20,
+                  na.rm = TRUE, colour = "black") +
+  theme_classic() +
+  labs(
+    x = expression(log[2]~"fold change (HET vs WT)"),
+    y = expression(-log[10]~"adjusted p-value"),
+    title = "Differential expression at P35",
+    colour = NULL
+  ) +
+  theme(legend.position = "top")
+ggplot(rank_age35, aes(x = logFC, y = -log10(adj.P.Val), colour = sig)) +
+  geom_point(size = 1.2, alpha = 0.6) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", colour = "grey50") +
+  scale_colour_manual(
+    values = c("Up" = "#E69F00", "Down" = "#0072B2", "NS" = "grey70"),
+    breaks = c("Down", "Up")  # this removes NS from legend
+  ) +
+  geom_text_repel(aes(label = label), size = 5, max.overlaps = 20,
+                  na.rm = TRUE, colour = "black", force = 2) +
+  theme_classic() +
+  labs(
+    x = expression(log[2]~"fold change (HET vs WT)"),
+    y = expression(-log[10]~"adjusted p-value"),
+    colour = NULL
+  ) +
+  theme(
+    legend.position = "top",
+    legend.text = element_text(size = 14, face = "bold"),  # increase legend text size
+    legend.key.size = unit(1.2, "cm"),
+  )                                        # increase legend dot size
+
+ggsave("volcano_p35.png", width = 7, height = 6, dpi = 300)
+
+
+
+
+
+
+
+# Query biomaRt for gene symbols and descriptions for p35
+
+gene_map <- getBM(
+  attributes = c("ensembl_gene_id", "mgi_symbol"),
+  filters = "ensembl_gene_id",
+  values = p35triosynaptosomes$ensembl_gene_id,
+  mart = mart
+)
+p35triosynaptosomes$ensembl_gene_id
+
+library(dplyr)
+
+p35triosynaptosomes <- p35triosynaptosomes %>%
+  left_join(gene_map, by = "ensembl_gene_id") %>%
+  select(hgnc_symbol, everything())  # put gene symbol first
+
+gene_info <- getBM(
+  attributes = c(
+    "ensembl_gene_id",
+    "mgi_symbol",
+    "description",
+    "gene_biotype",
+    "chromosome_name"
+  ),
+  filters = "ensembl_gene_id",
+  values = p35triosynaptosomes$ensembl_gene_id,
+  mart = mart
+)
+
+head(gene_info)
+
+p35triosynaptosomes <- p35triosynaptosomes %>%
+  left_join(gene_info, by = "ensembl_gene_id") %>%
+  select(description, everything())  # put gene symbol first
+
+# Pathway analysis for p35
+
+install.packages("gprofiler2")
+library(gprofiler2)
+
+# By effect size:
+ranked_gene_ids <- rownames(p35triosynaptosomes)[order(abs(p35triosynaptosomes$logFC), decreasing = TRUE)]
+
+
+pathways <- gost(rownames(x$counts),
+                 exclude_iea = T, # exclude electronic annotations
+                 organism = "mmusculus",
+                 correction_method = "bonferroni",
+                 sources = c("GO", "KEGG", "REAC"),
+                 significant = T, ordered = F)
+
+
+pathways1 <- gost(DEG35,
+                  exclude_iea = T, # exclude electronic annotations
+                  organism = "mmusculus",
+                  correction_method = "bonferroni",
+                  sources = c("GO:BP"),
+                  custom_bg = background)
+
+View(arrange(pathways$result, p_value))
+
+View(arrange(pathways1$result))
+
+# Interactive plot
+gostplot(pathways, capped = F, interactive = T)
+gostplot(pathways1, capped = F, interactive = T)
+tab_ranked <- publish_gosttable(
+  pathways,
+  highlight_terms = NULL,    
+  use_colors = TRUE,
+  show_columns = c("source", "term_name", "term_size", "intersection_size"),
+  filename = NULL                   
+)
+tab_ranked
+
+
+
+# Heat map
+
+topgenes <- rownames(tt)[1:100]
+i <- which(rownames(lcpm) %in% topgenes)
+group <- x$samples$genotype
+mycol <- colorpanel(1000, "blue", "white", "red")
+
+heatmap.2(
+  lcpm[i, ],
+  scale = "row",
+  labRow = v$genes$SYMBOL[i],   
+  labCol = group,
+  col = mycol,
+  trace = "none",
+  density.info = "none",
+  margin = c(8, 6),
+  lhei = c(2, 10),
+  dendrogram = "column"
+)
+
+# Plots
+
+plotMD(efit, column = 1)
+abline(h = 0, col = "blue")
+plotMD(efit, column = 1, status = decideTests(efit)[,1])
+abline(h = 0, col = "blue")
+
+top <- topTable(efit, number = 10)
+plotMD(efit, column = 1, status = decideTests(efit)[,1])
+text(
+  efit$Amean[rownames(top)],
+  efit$coefficients[rownames(top), 1],
+  labels = top$SYMBOL,
+  cex = 0.7,
+  pos = 3
+)
+
+
+glMDPlot(efit, coef=1, status=dt, main=colnames(efit)[1],
+         side.main="ENTREZID", counts=lcpm, groups=group, launch=FALSE)
+
+tt <- topTable(efit, number = Inf)
+tt$label <- ifelse(is.na(tt$SYMBOL), rownames(tt), tt$SYMBOL)
+
+glMDPlot(
+  fit = efit,
+  coef = 1,
+  x = v$E,
+  anno = tt,
+  status = decideTests(efit)[,1],
+  gene.labels = tt$label
+)
+
+glMDPlot(
+  fit    = efit,
+  coef   = 1,
+  x      = v$E,
+  xval   = efit$Amean,
+  yval   = efit$coefficients[, 1],
+  anno   = tt,
+  status = decideTests(efit)[, 1]
+)
+tt <- topTable(efit, coef = 1, number = Inf)
+glMDPlot(
+  fit    = efit,
+  coef   = 1,
+  x      = v$E,
+  anno   = tt,
+  xval   = "AveExpr",
+  yval   = "logFC",
+  status = decideTests(efit)[,1]
+)
+
+----####Gene sets for MAGMA####----
+
+# Background (all genes tested)
+BACKGROUND <- rownames(x)
+
+# DE gene sets
+P0_DE  <- rownames(p0triosynaptosome)
+P7_DE  <- rownames(p7triosynaptosome)
+P35_DE <- rownames(p35triosynaptosomes)
+
+ALL_DE <- unique(c(
+  P0_DE,
+  P7_DE,
+  P35_DE
+))
+
+# Directional DE sets
+P0_up   <- p0triosynaptosome$ensembl_gene_id[p0triosynaptosome$logFC > 0 ]
+P0_down <- p0triosynaptosome$ensembl_gene_id[p0triosynaptosome$logFC < 0 ]
+
+P7_up   <- p7triosynaptosome$ensembl_gene_id[p7triosynaptosome$logFC > 0 ]
+P7_down <- p7triosynaptosome$ensembl_gene_id[p7triosynaptosome$logFC < 0]
+
+P35_up   <- p35triosynaptosomes$ensembl_gene_id[p35triosynaptosomes$logFC > 0 ]
+P35_down <- p35triosynaptosomes$ensembl_gene_id[p35triosynaptosomes$logFC < 0 ]
+
+library(biomaRt)
+
+mouse <- useEnsembl(
+  biomart = "genes",
+  dataset = "mmusculus_gene_ensembl"
+)
+
+all_mouse_genes <- unique(c(
+  BACKGROUND,
+  ALL_DE,
+  P0_up, P0_down,
+  P7_up, P7_down,
+  P35_up, P35_down,
+  presynapse_union
+))
+
+orth <- getBM(
+  attributes = c(
+    "ensembl_gene_id",
+    "hsapiens_homolog_ensembl_gene"
+  ),
+  filters = "ensembl_gene_id",
+  values = all_mouse_genes,
+  mart = mouse
+)
+
+colnames(orth) <- c(
+  "mouse_ensembl",
+  "human_ensembl"
+)
+
+orth <- orth[
+  orth$human_ensembl != "",
+]
+
+mouse_tab <- table(orth$mouse_ensembl)
+human_tab <- table(orth$human_ensembl)
+
+orth_true1to1 <- orth[
+  orth$mouse_ensembl %in% names(mouse_tab[mouse_tab == 1]) &
+    orth$human_ensembl %in% names(human_tab[human_tab == 1]),
+]
+
+table(table(orth_true1to1$mouse_ensembl))
+table(table(orth_true1to1$human_ensembl))
+
+#MAGMA EACH AGE
+
+magma_age <- rbind(
+  data.frame(GENE = P0_DE,  SET = "P0_DE"),
+  data.frame(GENE = P7_DE,  SET = "P7_DE"),
+  data.frame(GENE = P35_DE, SET = "P35_DE"),
+  data.frame(GENE = BACKGROUND,
+             SET = "BACKGROUND")
+)
+
+magma_age <- merge(
+  magma_age,
+  orth_true1to1,
+  by.x = "GENE",
+  by.y = "mouse_ensembl"
+)
+
+magma_age <- magma_age[, c(
+  "human_ensembl",
+  "SET"
+)]
+
+colnames(magma_age) <- c(
+  "GENE",
+  "SET"
+)
+
+magma_age <- unique(magma_age)
+
+write.table(
+  magma_age,
+  "magma_age.txt",
+  sep = "\t",
+  quote = FALSE,
+  row.names = FALSE,
+  col.names = FALSE
+)
+
+
+#MAGMA ALL
+
+magma_all <- rbind(
+  data.frame(GENE = ALL_DE,
+             SET = "ALL_DE"),
+  data.frame(GENE = BACKGROUND,
+             SET = "BACKGROUND")
+)
+
+magma_all <- merge(
+  magma_all,
+  orth_true1to1,
+  by.x = "GENE",
+  by.y = "mouse_ensembl"
+)
+
+magma_all <- magma_all[, c(
+  "human_ensembl",
+  "SET"
+)]
+
+colnames(magma_all) <- c(
+  "GENE",
+  "SET"
+)
+
+magma_all <- unique(magma_all)
+
+write.table(
+  magma_all,
+  "magma_all60samples.txt",
+  sep = "\t",
+  quote = FALSE,
+  row.names = FALSE,
+  col.names = FALSE
+)
+
+#MAGMA DIRECTIONAL
+
+magmadirectional <- rbind(
+  data.frame(GENE = P35_up,   SET = "P35_up"),
+  data.frame(GENE = P35_down, SET = "P35_down"),
+  data.frame(GENE = P7_down,  SET = "P7_down"),
+  data.frame(GENE = P0_up,    SET = "P0_up"),
+  data.frame(GENE = P0_down,  SET = "P0_down"),
+  data.frame(GENE = BACKGROUND,
+             SET = "BACKGROUND")
+)
+
+magma_directional <- merge(
+  magmadirectional,
+  orth_true1to1,
+  by.x = "GENE",
+  by.y = "mouse_ensembl"
+)
+
+magma_directional <- magma_directional[, c(
+  "human_ensembl",
+  "SET"
+)]
+
+colnames(magma_directional) <- c(
+  "GENE",
+  "SET"
+)
+
+magma_directional <- unique(magma_directional)
+
+write.table(
+  magma_directional,
+  "magma_directional60samples.txt",
+  sep = "\t",
+  quote = FALSE,
+  row.names = FALSE,
+  col.names = FALSE
+)
+
+#MAGMAPRESYNAPSE
+
+magmapresynapse <- rbind(
+  data.frame(GENE = presynapse_union,
+             SET = "presynapse"),
+  data.frame(GENE = BACKGROUND,
+             SET = "BACKGROUND")
+)
+
+magma_presynapse <- merge(
+  magmapresynapse,
+  orth_true1to1,
+  by.x = "GENE",
+  by.y = "mouse_ensembl"
+)
+
+magma_presynapse <- magma_presynapse[, c(
+  "human_ensembl",
+  "SET"
+)]
+
+colnames(magma_presynapse) <- c(
+  "GENE",
+  "SET"
+)
+
+magma_presynapse <- unique(magma_presynapse)
+
+write.table(
+  magma_presynapse,
+  "magma_presynapse60samples.txt",
+  sep = "\t",
+  quote = FALSE,
+  row.names = FALSE,
+  col.names = FALSE
+)
