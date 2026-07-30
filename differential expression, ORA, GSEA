@@ -115,20 +115,19 @@ counts <- counts[, !colnames(counts) %in% drop.samples]
 trio <- trio[trio$sample %in% colnames(counts), ]
 trio <- trio[match(colnames(counts), trio$sample), ]
 
-#### Get gene biotypes ####
+#### Get gene names and biotypes ####
 
-mart <- useMart(
-  biomart = "ensembl",
-  dataset = "mmusculus_gene_ensembl",
-  host    = "https://nov2020.archive.ensembl.org"
+mart <- useEnsembl(
+  biomart = "genes",
+  dataset = "mmusculus_gene_ensembl"
 )
 
-#biotype <- getBM(
- # attributes = c("ensembl_gene_id", "gene_biotype"),
- # filters = "ensembl_gene_id",
-  #values = rownames(x$counts),
-  #mart = mart
-#)
+biotype <- getBM(
+  attributes = c("ensembl_gene_id", "gene_biotype"),
+  filters = "ensembl_gene_id",
+  values = rownames(x$counts),
+  mart = mart
+)
 
 annot <- getBM(
   attributes = c(
@@ -145,22 +144,16 @@ x$genes <- annot[  match(rownames(x), annot$ensembl_gene_id),]
 
 # Keep protein-coding genes only
 
-#pc_genes <- biotype$ensembl_gene_id[biotype$gene_biotype == "protein_coding"]
+pc_genes <- biotype$ensembl_gene_id[biotype$gene_biotype == "protein_coding"]
+
+## Reads in protein coding genes, skips above steps
+
 pc_genes <- readRDS("pc_genesTRIOSYN.rds")
 
 # Filter the DGEList for protein-coding genes
 
 keep_genes <- rownames(x) %in% pc_genes
 x <- x[keep_genes, , keep.lib.sizes = FALSE]
-
-# Converting counts to log counts per million
-
-cpm <- cpm(x)
-lcpm <- cpm(x, log=TRUE)
-
-L <- mean(x$samples$lib.size) * 1e-6
-M <- median(x$samples$lib.size) * 1e-6
-c(L, M)
 
 # Removing lowly expressed genes by design matrix
 
@@ -239,12 +232,12 @@ if(make_plots){plotMDS(lcpm, dim = c(1,2), col = col.group, labels = x$samples$a
 
 # Sample-sample correlations
 
-cor_mat <- cor(v$E)
+cor_mat <- cor(lcpm)
 pheatmap::pheatmap(cor_mat)
-boxplot(v$E,
+boxplot(lcpm,
          las = 2,
          outline = FALSE)
-hc <- hclust(dist(t(v$E)))
+hc <- hclust(dist(t(lcpm)))
 plot(hc)
 
 # Library size visualisation
@@ -272,7 +265,7 @@ meta$age <- as.numeric(meta$age)
 meta$batch <- as.numeric(meta$batch)
 
 cor.test(pcs[,1], meta$age)
-cor.test(pcs[,2], meta$age) # Principal components 1 and 2 correlate with age (particularly component 1)
+cor.test(pcs[,2], meta$age) # Principal component 1 correlates with age 
 
 cor.test(pcs[,1], meta$batch)
 cor.test(pcs[,2], meta$batch) # Principal components 1 and 2 do not correlate with batch
@@ -297,7 +290,7 @@ results <- lapply(1:5, function(pc) {
 
 pc_assoc <- do.call(rbind, results)
 rownames(pc_assoc) <- paste0("PC", 1:5)
-pc_assoc
+pc_assoc                    # PC1 correlates with age, PC4 correlates with sex and batch, PC5 correlates with sex. Sex and batch should be included in model design 
 
 ### Surrogate variables ###
 
@@ -315,13 +308,12 @@ x$samples <- cbind(x$samples, sv)
 
 #### Model WT vs. HET all ages ####
 
-x$samples$genotype <- relevel(x$samples$genotype, "WT")
-
 sapply(x$samples[, c("group", "age", "sex", "batch")], function(v) {
   if (is.factor(v)) nlevels(v) else length(unique(v))
 })
 x$samples$age <- factor(x$samples$age)
 x$samples$genotype <- factor(x$samples$genotype)
+x$samples$genotype <- relevel(x$samples$genotype, "WT")
 x$samples$sex   <- factor(x$samples$sex)
 x$samples$batch <- factor(x$samples$batch)
 
